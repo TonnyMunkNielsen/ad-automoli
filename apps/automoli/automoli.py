@@ -20,7 +20,7 @@ from typing import Any
 import hassapi as hass
 import adbase as ad
 
-__version__ = "0.11.3"
+__version__ = "0.11.4"
 
 APP_NAME = "AutoMoLi"
 APP_ICON = "💡"
@@ -186,6 +186,19 @@ class AutoMoLi(hass.Hass):  # type: ignore
                     entity_id=self.entity_id,  # type:ignore
                 )
 
+    # Methods called by run_in can only have kwargs but cannot update self.lg
+    # because *args and **kwargs are required for AppDaemon's self.log method
+    def lg_delayed(self, kwargs: dict[str, Any] | None = None) -> None:
+        kwargs.setdefault("ascii_encode", False)
+        msg = kwargs.get("msg", "")
+        level = kwargs.get("level", None)
+        icon = kwargs.get("icon", None)
+        repeat = kwargs.get("repeat", 1)
+        log_to_ha = kwargs.get("log_to_ha", False)
+        self.lg(
+            msg=f"{msg}", level=level, icon=icon, repeat=repeat, log_to_ha=log_to_ha
+        )
+
     def listr(
         self,
         list_or_string: list[str] | set[str] | str | Any,
@@ -213,7 +226,8 @@ class AutoMoLi(hass.Hass):  # type: ignore
         default: Any,
     ) -> Any:
         """Get configuration options from the current app if they exist but if not fall back
-        to any options defined in an app named 'default' or worst case to a default value passed in"""
+        to any options defined in an app named 'default' or worst case to a default value passed in
+        """
         if name in self.args:
             return self.args.pop(name)
         elif (
@@ -607,7 +621,29 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 appInit=True,
                 source="On at restart",
             )
+
+            light_setting = (
+                self.active.get("light_setting")
+                if not self.night_mode_active()
+                else self.night_mode.get("light")
+            )
+            message = (
+                f"{hl(self.room.name.replace('_',' ').title())} was {hl('on')} when AutoMoLi started → "
+                f"brightness: {hl(light_setting)}%"
+                f" | delay: {hl(natural_time(int(self.active['delay'])))}"
+            )
+            # Since in initialization loop, wait 10s for all rooms to load before logging
+            self.run_in(self.lg_delayed, 10, msg=message, icon=ON_ICON)
+
             self.refresh_timer()
+        else:
+            self.run_in(
+                self.update_room_stats,
+                0,
+                stat="lastOff",
+                appInit=True,
+                source="Off at restart",
+            )
 
     def switch_daytime(self, kwargs: dict[str, Any]) -> None:
         """Set new light settings according to daytime."""
@@ -658,6 +694,27 @@ class AutoMoLi(hass.Hass):  # type: ignore
         schedules the callback to switch the lights off after a `state_changed` callback
         of a motion sensors changing to "cleared" is received
         """
+        state = new
+        old_state = old
+        # Check if got entire state object
+        if attribute == "all":
+            state = dict(new).get("state")
+            old_state = dict(old).get("state", "unknown")
+
+        # do not process if state has changed from off to unavailable or unknown (or vice versa)
+        # or if state has not actually changed (new == old)
+        if (
+            (
+                state in ("unavailable", "unknown")
+                and old_state == self.states["motion_off"]
+            )
+            or (
+                state == self.states["motion_off"]
+                and old_state in ("unavailable", "unknown")
+            )
+            or state == old_state
+        ):
+            return
 
         # start the timer if motion is cleared
         self.lg(
@@ -665,7 +722,7 @@ class AutoMoLi(hass.Hass):  # type: ignore
             level=logging.DEBUG,
         )
 
-        # Handle case when motion sensor may be unknown or unavailable
+        # Handle case when motion sensor went from "on" to unknown or unavailable
         states = {self.states["motion_off"], "unknown", "unavailable"}
 
         if all(
@@ -842,8 +899,11 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 )
             # if turned a light off manually, probably don't want AutoMoLi to immediately
             # turn it back on so start cooldown period
-            self.cooling_down = True
-            self.cooling_down_handle = self.run_in(self.cooldown_off, DEFAULT_COOLDOWN)
+            if old_state == "on":
+                self.cooling_down = True
+                self.cooling_down_handle = self.run_in(
+                    self.cooldown_off, DEFAULT_COOLDOWN
+                )
         elif state == "on":
             # update stats to set room on when this is the first light turned on
             if self.sensor_state == "off":
@@ -914,11 +974,11 @@ class AutoMoLi(hass.Hass):  # type: ignore
 
         # if an external event (e.g., switch turned on manually) was detected use delay_outside_events
         if refresh_type == "outside_change":
-            delay = self.delay_outside_events
+            delay = int(self.delay_outside_events)
         elif refresh_type == "override_delay":
-            delay = self.override_delay
+            delay = int(self.override_delay)
         else:
-            delay = self.active.get("delay")
+            delay = int(self.active["delay"])
 
         # if no delay is set or delay = 0, lights will not switched off by AutoMoLi
         if delay:
@@ -1588,9 +1648,7 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 starttime = str(daytime.get("starttime"))
                 if starttime.count(":") == 1:
                     starttime += ":00"
-                dt_start = (self.parse_time(starttime, aware=True)).replace(
-                    microsecond=0
-                )
+                dt_start = (self.parse_time(starttime)).replace(microsecond=0)
                 daytime["starttime"] = dt_start
             except ValueError as error:
                 raise ValueError(
@@ -1615,9 +1673,7 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 if next_starttime.count(":") == 1:
                     next_starttime += ":00"
                 next_dt_name = str(daytimes[(idx + 1) % len(daytimes)].get("name"))
-                next_dt_start = (self.parse_time(next_starttime, aware=True)).replace(
-                    microsecond=0
-                )
+                next_dt_start = (self.parse_time(next_starttime)).replace(microsecond=0)
             except ValueError as error:
                 raise ValueError(
                     f"missing start time in daytime '{next_dt_name}': {error}"
@@ -1851,17 +1907,17 @@ class AutoMoLi(hass.Hass):  # type: ignore
                         self.entity_id, "times_turned_on_by_automations", default=0
                     )
                 ) != 0:
-                    self.sensor_attr[
-                        "times_turned_on_by_automations"
-                    ] = countAutomationOn
+                    self.sensor_attr["times_turned_on_by_automations"] = (
+                        countAutomationOn
+                    )
                 if (
                     countAutomationOff := self.get_state(
                         self.entity_id, "times_turned_off_by_automations", default=0
                     )
                 ) != 0:
-                    self.sensor_attr[
-                        "times_turned_off_by_automations"
-                    ] = countAutomationOff
+                    self.sensor_attr["times_turned_off_by_automations"] = (
+                        countAutomationOff
+                    )
                 if (
                     countManualOn := self.get_state(
                         self.entity_id, "times_turned_on_manually", default=0
@@ -1959,7 +2015,7 @@ class AutoMoLi(hass.Hass):  # type: ignore
             self.sensor_attr["last_motion_detected"] = currentTimeStr
             self.sensor_attr["last_motion_by"] = self.get_name(kwargs.get("entity"))
             self.sensor_attr.pop("last_motion_cleared", "")
-            self.sensor_attr.pop("turning_off_at", "")
+            self.sensor_attr["turning_off_at"] = "Waiting for motion to clear"
 
         elif stat == "motion_cleared":
             self.sensor_attr["last_motion_cleared"] = currentTimeStr
@@ -1972,7 +2028,6 @@ class AutoMoLi(hass.Hass):  # type: ignore
             self.sensor_state = "on"
 
             self.sensor_attr["last_turned_on"] = currentTimeStr
-            self.sensor_attr.pop("last_turned_off", "")
             countAutomoliOn = self.sensor_attr.get("times_turned_on_by_automoli", 0)
             countAutomationOn = self.sensor_attr.get(
                 "times_turned_on_by_automations", 0
@@ -2000,8 +2055,7 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 self.sensor_attr.pop("last_motion_cleared", "")
                 self.sensor_attr.pop("last_motion_by", "")
             source = kwargs.get("source", "<unknown>")
-            self.sensor_attr["turned_on_by"] = source
-            self.sensor_attr.pop("turned_off_by", "")
+            self.sensor_attr["last_turned_on_by"] = source
             self.sensor_attr.pop("delay_overridden_by", "")
             self.sensor_attr.pop("blocked_on_by", "")
             self.sensor_attr.pop("disabled_by", "")
@@ -2024,10 +2078,14 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 self.sensor_onToday
             )
             if howChanged == "automoli":
-                countAutomoliOff = self.sensor_attr.get(
-                    "times_turned_off_by_automoli", 0
-                )
-                self.sensor_attr["times_turned_off_by_automoli"] = countAutomoliOff + 1
+                # do not update automoli count on reboot
+                if not kwargs.get("appInit", False):
+                    countAutomoliOff = self.sensor_attr.get(
+                        "times_turned_off_by_automoli", 0
+                    )
+                    self.sensor_attr["times_turned_off_by_automoli"] = (
+                        countAutomoliOff + 1
+                    )
             elif howChanged == "automation":
                 countAutomationOff = self.sensor_attr.get(
                     "times_turned_off_by_automations", 0
@@ -2039,8 +2097,7 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 countManualOff = self.sensor_attr.get("times_turned_off_manually", 0)
                 self.sensor_attr["times_turned_off_manually"] = countManualOff + 1
             source = kwargs.get("source", "<unknown>")
-            self.sensor_attr["turned_off_by"] = source
-            self.sensor_attr.pop("turned_on_by", "")
+            self.sensor_attr["last_turned_off_by"] = source
             self.sensor_attr.pop("turning_off_at", "")
             self.sensor_attr.pop("blocked_off_by", "")
             self.sensor_attr.pop("disabled_by", "")
