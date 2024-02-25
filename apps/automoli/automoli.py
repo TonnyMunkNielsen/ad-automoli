@@ -531,24 +531,23 @@ class AutoMoLi(hass.Hass):  # type: ignore
                         new=self.states["motion_off"],
                     )
                 )
-        # set up state listener for each light, if tracking events outside automoli
-        if self.only_own_events == False:
-            self.lg(
-                "handling events outside AutoMoLi - adding state listeners for lights",
-                level=logging.DEBUG,
-            )
-            at_least_one_turned_on = False
-            for light in self.lights:
-                listener.add(
-                    self.listen_state(
-                        self.outside_change_detected,
-                        entity_id=light,
-                        attribute="all",
-                    )
+
+        # set up state listener for each light even if only want to turn off lights via automoli
+        self.lg(
+            "handling events outside AutoMoLi - adding state listeners for lights",
+            level=logging.DEBUG,
+        )
+        for light in self.lights:
+            listener.add(
+                self.listen_state(
+                    self.outside_change_detected,
+                    entity_id=light,
+                    attribute="all",
                 )
-                # assume any lights that are currently on were switched on by AutoMoLi
-                if self.get_state(light, copy=False) == "on":
-                    self._switched_on_by_automoli.add(light)
+            )
+            # assume any lights that are currently on were switched on by AutoMoLi
+            if self.get_state(light, copy=False) == "on":
+                self._switched_on_by_automoli.add(light)
 
         # Track if within cooling down period
         self.cooling_down: bool = False
@@ -914,8 +913,11 @@ class AutoMoLi(hass.Hass):  # type: ignore
                     howChanged=how,
                     source=source,
                 )
-            # refresh timer if any lights turned on manually
-            self.refresh_timer(refresh_type="outside_change")
+            # refresh timer if any lights turned on manually unless only_own_events is True
+            if self.only_own_events == False:
+                self.refresh_timer(refresh_type="outside_change")
+            else:
+                self.run_in(self.update_room_stats, 0, stat="onlyOwnEventsBlock")
 
     def cooldown_off(self, _: dict[str, Any] | None = None) -> None:
         self.cooling_down = False
@@ -2137,6 +2139,9 @@ class AutoMoLi(hass.Hass):  # type: ignore
                 self.sensor_attr["disabled_by"] = self.get_name(entity)
             else:
                 self.sensor_attr["disabled_by"] = entity
+
+        elif stat == "onlyOwnEventsBlock":
+            self.sensor_attr["blocked_off_by"] = "Manually turned on"
 
         # If the room is still on, record all the time it was on until now
         if self.sensor_state == "on":
